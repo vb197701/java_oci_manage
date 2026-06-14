@@ -44,11 +44,11 @@ def create_release(tag, repo, name, body, prerelease=False, draft=False):
     prerelease_flag = "--prerelease" if prerelease else ""
     draft_flag = "--draft" if draft else ""
     
-    cmd = f'''gh release create "{tag}" -R "{repo}" \
-        --title "{name}" \
-        --notes "{body}" \
-        {prerelease_flag} \
-        {draft_flag}'''
+    cmd = f"""gh release create "{tag}" -R "{repo}" \\
+        --title "{name}" \\
+        --notes "{body}" \\
+        {prerelease_flag} \\
+        {draft_flag}"""
     
     r = sh(cmd, check=False)
     if r.returncode == 0:
@@ -75,42 +75,36 @@ def get_release_assets(repo, release_tag):
     
     return assets
 
-def download_asset(repo, release_tag, asset_name, work_dir):
-    """Download a single asset"""
-    asset_path = work_dir / asset_name
-    
-    # Skip if already exists
-    if asset_path.exists():
-        print(f"  - {asset_name} already exists, skipping")
-        return True
-    
-    # Download single asset
-    cmd = f'gh release download "{release_tag}" -R "{repo}" -p "{asset_name}" -D "{work_dir}"'
-    r = sh(cmd, check=False)
-    
-    if r.returncode == 0 and asset_path.exists():
-        print(f"  ✓ Downloaded {asset_name}")
-        return True
-    else:
-        print(f"  ✗ Failed to download {asset_name}: {r.stderr}")
+def release_has_missing_assets(release_tag, repo):
+    """Check if release has missing assets compared to upstream"""
+    # Get upstream assets
+    r = sh(f'gh release view "{release_tag}" -R "{UPSTREAM}" --json assets', check=False)
+    if r.returncode != 0:
         return False
-
-def upload_asset(release_tag, repo, asset_path):
-    """Upload a single asset"""
-    asset_name = asset_path.name
     
-    cmd = f'gh release upload "{release_tag}" "{asset_path}" -R "{repo}" --clobber'
-    r = sh(cmd, check=False)
-    
-    if r.returncode == 0:
-        print(f"  ✓ Uploaded {asset_name}")
-        return True
-    else:
-        print(f"  ✗ Failed to upload {asset_name}: {r.stderr}")
+    upstream_assets = json.loads(r.stdout).get("assets", [])
+    if not upstream_assets:
         return False
+    
+    # Get target assets
+    r = sh(f'gh release view "{release_tag}" -R "{repo}" --json assets', check=False)
+    if r.returncode != 0:
+        return False
+    
+    target_assets = json.loads(r.stdout).get("assets", [])
+    target_asset_names = {a["name"] for a in target_assets}
+    
+    # Check if any upstream asset is missing
+    missing = [a["name"] for a in upstream_assets if a["name"] not in target_asset_names]
+    
+    if missing:
+        print(f"  Release {release_tag} missing {len(missing)} assets: {missing}")
+        return True
+    
+    return False
 
-def sync_assets(release_tag):
-    """Sync all assets from upstream to target"""
+def sync_assets(release_tag, repo):
+    """Sync all assets from source to target"""
     work = Path("/tmp/release-sync")
     work.mkdir(parents=True, exist_ok=True)
     
@@ -122,19 +116,34 @@ def sync_assets(release_tag):
             pass
     
     # Get upstream assets
-    upstream_assets = get_release_assets(UPSTREAM, release_tag)
+    upstream_assets = get_release_assets(repo, release_tag)
     
     if not upstream_assets:
         print(f"No assets found for release {release_tag}")
         return False
     
-    # Download each asset from upstream
-    print(f"Downloading assets from upstream...")
+    # Download each asset from source
+    print(f"Downloading assets from {repo}...")
     downloaded = []
     for asset in upstream_assets:
         name = asset["name"]
-        if download_asset(UPSTREAM, release_tag, name, work):
-            downloaded.append(work / name)
+        asset_path = work / name
+        
+        # Skip if already exists
+        if asset_path.exists():
+            print(f"  - {name} already exists in work dir, skipping download")
+            downloaded.append(asset_path)
+            continue
+        
+        # Download single asset
+        cmd = f'gh release download "{release_tag}" -R "{repo}" -p "{name}" -D "{work}"'
+        r = sh(cmd, check=False)
+        
+        if r.returncode == 0 and asset_path.exists():
+            print(f"  ✓ Downloaded {name}")
+            downloaded.append(asset_path)
+        else:
+            print(f"  ✗ Failed to download {name}: {r.stderr}")
     
     if not downloaded:
         print("No assets downloaded")
@@ -142,15 +151,103 @@ def sync_assets(release_tag):
     
     print(f"Downloaded {len(downloaded)} assets")
     
-    # Upload each asset to target
-    print(f"Uploading assets to target...")
+    # Upload each asset to target repo
+    print(f"Uploading assets to {TARGET}...")
     uploaded = 0
     for asset_path in downloaded:
-        if upload_asset(release_tag, TARGET, asset_path):
+        name = asset_path.name
+        
+        # Check if already exists in target
+        r = sh(f'gh release view "{release_tag}" -R "{TARGET}" --json assets', check=False)
+        if r.returncode == 0:
+            target_assets = json.loads(r.stdout).get("assets", [])
+            target_asset_names = {a["name"] for a in target_assets}
+            if name in target_asset_names:
+                print(f"  - {name} already exists in target, skipping upload")
+                uploaded += 1
+                continue
+        
+        # Upload
+        cmd = f'gh release upload "{release_tag}" "{asset_path}" -R "{TARGET}" --clobber'
+        r = sh(cmd, check=False)
+        
+        if r.returncode == 0:
+            print(f"  ✓ Uploaded {name}")
             uploaded += 1
+        else:
+            print(f"  ✗ Failed to upload {name}: {r.stderr}")
     
     print(f"Uploaded {uploaded}/{len(downloaded)} assets")
     return uploaded > 0
+
+def sync_assets_to_existing_release(release_tag):
+    """Sync missing assets to an existing release"""
+    work = Path("/tmp/release-sync")
+    work.mkdir(parents=True, exist_ok=True)
+    
+    # Clean work directory
+    for f in work.glob("*"):
+        try:
+            f.unlink()
+        except:
+            pass
+    
+    # Get upstream assets
+    r = sh(f'gh release view "{release_tag}" -R "{UPSTREAM}" --json assets', check=False)
+    if r.returncode != 0:
+        print(f"Failed to get upstream assets for {release_tag}")
+        return False
+    
+    upstream_assets = json.loads(r.stdout).get("assets", [])
+    if not upstream_assets:
+        print(f"No upstream assets for {release_tag}")
+        return False
+    
+    # Get target assets
+    r = sh(f'gh release view "{release_tag}" -R "{TARGET}" --json assets', check=False)
+    if r.returncode != 0:
+        print(f"Failed to get target assets for {release_tag}")
+        return False
+    
+    target_assets = json.loads(r.stdout).get("assets", [])
+    target_asset_names = {a["name"] for a in target_assets}
+    
+    # Download and upload missing assets
+    missing_count = 0
+    uploaded_count = 0
+    for asset in upstream_assets:
+        name = asset["name"]
+        
+        if name in target_asset_names:
+            print(f"  - {name} already exists in target, skipping")
+            continue
+        
+        missing_count += 1
+        asset_path = work / name
+        
+        print(f"  Missing asset: {name}, downloading...")
+        
+        # Download
+        r = sh(f'gh release download "{release_tag}" -R "{UPSTREAM}" -p "{name}" -D "{work}"', check=False)
+        if r.returncode != 0 or not asset_path.exists():
+            print(f"  ✗ Failed to download {name}: {r.stderr}")
+            continue
+        
+        print(f"  ✓ Downloaded {name}")
+        
+        # Upload
+        cmd = f'gh release upload "{release_tag}" "{asset_path}" -R "{TARGET}" --clobber'
+        r = sh(cmd, check=False)
+        if r.returncode == 0:
+            print(f"  ✓ Uploaded missing asset {name}")
+            uploaded_count += 1
+        else:
+            print(f"  ✗ Failed to upload {name}: {r.stderr}")
+    
+    if missing_count > 0:
+        print(f"  Synced {uploaded_count}/{missing_count} missing assets to {release_tag}")
+    
+    return uploaded_count > 0
 
 def main():
     print(f"Syncing releases from {UPSTREAM} to {TARGET}")
@@ -164,6 +261,8 @@ def main():
         sys.exit(1)
     
     success_count = 0
+    assets_synced_count = 0
+    
     for idx, rel in enumerate(upstream, 1):
         tag = rel["tag_name"]
         name = rel["name"]
@@ -172,17 +271,26 @@ def main():
         print(f"\n[{idx}/{len(upstream)}] Processing release {tag}")
         
         if release_exists(tag, TARGET):
-            print(f"  Release {tag} already exists, skipping")
-            continue
+            # Check if missing assets
+            if release_has_missing_assets(tag, TARGET):
+                print(f"  Syncing missing assets to existing release {tag}")
+                if sync_assets_to_existing_release(tag):
+                    print(f"  ✓ Synced assets to {tag}")
+                    assets_synced_count += 1
+                continue
+            else:
+                print(f"  Release {tag} already exists with all assets, skipping")
+                continue
         
+        # Create new release
         if create_release(tag, TARGET, name, body):
-            if sync_assets(tag):
+            if sync_assets(tag, UPSTREAM):
                 success_count += 1
-        
-        print()
     
-    print("=" * 60)
-    print(f"Sync complete: {success_count}/{len(upstream)} releases synced successfully")
-
+    print("\n" + "=" * 60)
+    print(f"Sync complete:")
+    print(f"  - Created {success_count}/{len(upstream)} new releases with assets")
+    print(f"  - Synced assets to {assets_synced_count}/{len(upstream)} existing releases")
+    
 if __name__ == "__main__":
     main()
