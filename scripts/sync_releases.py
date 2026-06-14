@@ -7,191 +7,124 @@ from pathlib import Path
 UPSTREAM = os.environ["UPSTREAM"]
 TARGET = os.environ["TARGET"]
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_API = "https://api.github.com"
+def sh(cmd, check=True):
+    """Run shell command"""
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        print(f"Command failed: {cmd}")
+        print(f"stderr: {result.stderr}")
+    return result
 
-def api_get(url):
-    """GitHub API GET request"""
-    import urllib.request
-    import urllib.error
+def get_releases(repo):
+    """Get all releases using gh CLI"""
+    sh_cmd = f'gh release list -R "{repo}" --limit 500'
+    r = sh(sh_cmd, check=False)
     
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
+    if r.returncode != 0:
+        print(f"Failed to get releases: {r.stderr}")
+        return []
     
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode())
-    except urllib.error.HTTPError as e:
-        print(f"API Error {e.code}: {e.read().decode()}")
-        return None
-
-def api_post(url, data):
-    """GitHub API POST request"""
-    import urllib.request
-    import urllib.error
-    
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
-        "Content-Type": "application/json"
-    }
-    
-    try:
-        req = urllib.request.Request(
-            url, 
-            data=json.dumps(data).encode(), 
-            headers=headers, 
-            method="POST"
-        )
-        with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode())
-    except urllib.error.HTTPError as e:
-        print(f"API Error {e.code}: {e.read().decode()}")
-        return None
-
-def get_releases(repo, per_page=100):
-    """Get all releases from a repository"""
     releases = []
-    page = 1
-    
-    while True:
-        url = f"{GITHUB_API}/repos/{repo}/releases?per_page={per_page}&page={page}"
-        result = api_get(url)
-        
-        if not result:
-            break
-        
-        releases.extend(result)
-        
-        if len(result) < per_page:
-            break
-        
-        page += 1
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        tag = parts[0].strip()
+        name = parts[1].strip() if len(parts) > 1 else tag
+        releases.append({"tag_name": tag, "name": name})
     
     return releases
 
-def ensure_release(tag, src_release):
-    """Create release if it doesn't exist"""
-    # First check if release exists
-    url = f"{GITHUB_API}/repos/{TARGET}/releases/tags/{tag}"
-    existing = api_get(url)
+def release_exists(tag, repo):
+    """Check if release exists"""
+    r = sh(f'gh release view "{tag}" -R "{repo}" >/dev/null 2>&1', check=False)
+    return r.returncode == 0
+
+def create_release(tag, repo, name, body, prerelease=False, draft=False):
+    """Create a new release"""
+    prerelease_flag = "--prerelease" if prerelease else ""
+    draft_flag = "--draft" if draft else ""
     
-    if existing and existing.get("id"):
-        print(f"Release {tag} already exists, skipping")
-        return True
+    cmd = f'''gh release create "{tag}" -R "{repo}" \
+        --title "{name}" \
+        --notes "{body}" \
+        {prerelease_flag} \
+        {draft_flag}'''
     
-    # Create new release
-    data = {
-        "tag_name": tag,
-        "name": src_release.get("name") or tag,
-        "body": src_release.get("body") or f"Synced from upstream {UPSTREAM}",
-        "draft": src_release.get("draft", False),
-        "prerelease": src_release.get("prerelease", False)
-    }
-    
-    url = f"{GITHUB_API}/repos/{TARGET}/releases"
-    result = api_post(url, data)
-    
-    if result and result.get("id"):
+    r = sh(cmd, check=False)
+    if r.returncode == 0:
         print(f"Created release {tag}")
         return True
     else:
-        print(f"Failed to create release {tag}")
+        print(f"Failed to create release {tag}: {r.stderr}")
         return False
 
 def sync_assets(release_tag):
-    """Sync assets from upstream release to target release"""
-    # Get upstream release assets
-    url = f"{GITHUB_API}/repos/{UPSTREAM}/releases/tags/{release_tag}"
-    upstream_release = api_get(url)
+    """Sync assets using gh CLI"""
+    work = Path("/tmp/release-sync")
+    work.mkdir(parents=True, exist_ok=True)
     
-    if not upstream_release:
-        print(f"Failed to get upstream release {release_tag}")
-        return
+    # Clean work directory
+    for f in work.glob("*"):
+        f.unlink()
     
-    upstream_assets = upstream_release.get("assets", [])
-    if not upstream_assets:
-        return
+    # Download all assets from upstream
+    print(f"Downloading assets from upstream release {release_tag}")
+    download_cmd = f'gh release download "{release_tag}" -R "{UPSTREAM}" -D "{work}"'
+    r = sh(download_cmd, check=False)
     
-    # Get target release
-    url = f"{GITHUB_API}/repos/{TARGET}/releases/tags/{release_tag}"
-    target_release = api_get(url)
+    if r.returncode != 0:
+        print(f"Failed to download assets from upstream: {r.stderr}")
+        return False
     
-    if not target_release:
-        print(f"Target release {release_tag} not found, skipping assets")
-        return
+    # List downloaded files
+    assets = list(work.glob("*"))
+    if not assets:
+        print(f"No assets found for release {release_tag}")
+        return False
     
-    target_assets = target_release.get("assets", [])
-    target_asset_names = {a["name"] for a in target_assets}
+    print(f"Found {len(assets)} assets to upload")
     
-    # Upload missing assets
-    for asset in upstream_assets:
-        name = asset["name"]
-        download_url = asset["url"]
+    # Upload each asset to target
+    for asset in assets:
+        name = asset.name
+        upload_cmd = f'gh release upload "{release_tag}" "{asset}" -R "{TARGET}" --clobber'
+        r = sh(upload_cmd, check=False)
         
-        if name in target_asset_names:
-            print(f"Asset {name} already exists, skipping")
-            continue
-        
-        # Download asset
-        work = Path("/tmp/release-sync")
-        work.mkdir(parents=True, exist_ok=True)
-        local_path = work / name
-        
-        headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Accept": "application/octet-stream"
-        }
-        
-        try:
-            import urllib.request
-            req = urllib.request.Request(download_url, headers=headers)
-            with urllib.request.urlopen(req) as response:
-                local_path.write_bytes(response.read())
-        except Exception as e:
-            print(f"Failed to download asset {name}: {e}")
-            continue
-        
-        # Upload to target release
-        upload_url = f"{target_release['upload_url']}?name={name}"
-        upload_headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
-            "Content-Type": "application/octet-stream"
-        }
-        
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                upload_url,
-                data=local_path.read_bytes(),
-                headers=upload_headers,
-                method="POST"
-            )
-            with urllib.request.urlopen(req) as response:
-                print(f"Uploaded asset {name}")
-        except Exception as e:
-            print(f"Failed to upload asset {name}: {e}")
+        if r.returncode == 0:
+            print(f"✓ Uploaded asset {name}")
+        else:
+            print(f"✗ Failed to upload asset {name}: {r.stderr}")
+    
+    return True
 
 def main():
-    if not GITHUB_TOKEN:
-        print("ERROR: GITHUB_TOKEN is not set")
-        sys.exit(1)
-    
     print(f"Syncing releases from {UPSTREAM} to {TARGET}")
     
     # Get upstream releases
     upstream = get_releases(UPSTREAM)
     print(f"Found {len(upstream)} upstream releases")
     
+    if not upstream:
+        print("No upstream releases found")
+        sys.exit(1)
+    
     # Sync each release
+    success_count = 0
     for rel in upstream:
         tag = rel["tag_name"]
-        success = ensure_release(tag, rel)
-        if success:
-            sync_assets(tag)
+        name = rel["name"]
+        body = f"Synced from upstream {UPSTREAM}"
+        
+        if release_exists(tag, TARGET):
+            print(f"Release {tag} already exists, skipping")
+            continue
+        
+        if create_release(tag, TARGET, name, body):
+            if sync_assets(tag):
+                success_count += 1
+    
+    print(f"\nSync complete: {success_count}/{len(upstream)} releases synced successfully")
 
 if __name__ == "__main__":
     main()
